@@ -1,0 +1,173 @@
+name: HF89 real REAPER gate
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/hf89-real-reaper.yml"
+      - "hf89/**"
+  workflow_dispatch:
+
+jobs:
+  real-reaper:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download official REAPER 7.81 x64
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'reaper781_x64-install.exe'
+          Invoke-WebRequest -Uri 'https://dlcf.reaper.fm/7.x/reaper781_x64-install.exe' -OutFile $installer
+          $size=(Get-Item $installer).Length
+          Write-Host "REAPER installer bytes=$size"
+          if($size -lt 10000000){ throw "Unexpected REAPER installer size: $size" }
+
+      - name: Install isolated REAPER
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'reaper781_x64-install.exe'
+          $dest = Join-Path $env:RUNNER_TEMP 'REAPER-HF89'
+          Start-Process -FilePath $installer -ArgumentList @('/S',"/D=$dest") -Wait
+          if(!(Test-Path (Join-Path $dest 'reaper.exe'))){ throw 'REAPER install failed' }
+          @"
+          [REAPER]
+          loadlastproj=0
+          splash=0
+          checkforupdates=0
+          "@ | Set-Content -LiteralPath (Join-Path $dest 'reaper.ini') -Encoding ASCII
+          Write-Host "REAPER executable: $(Join-Path $dest 'reaper.exe')"
+
+      - name: Build real-REAPER probe files
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'hf89-real'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          @'
+          <REAPER_PROJECT 0.1 "7.81/win64" 0
+            RIPPLE 0
+            GROUPOVERRIDE 0 0 0
+            AUTOXFADE 1
+          >
+          '@ | Set-Content -LiteralPath (Join-Path $root 'Client.rpp') -Encoding ASCII
+          @'
+          <REAPER_PROJECT 0.1 "7.81/win64" 0
+            RIPPLE 0
+            GROUPOVERRIDE 0 0 0
+            AUTOXFADE 1
+          >
+          '@ | Set-Content -LiteralPath (Join-Path $root 'Other.rpp') -Encoding ASCII
+
+          @'
+          local out=os.getenv("RUNNER_TEMP").."\\hf89-real\\ready.txt"
+          local f=assert(io.open(out,"w"))
+          local _,path=reaper.EnumProjects(-1,"")
+          f:write(path or "")
+          f:close()
+          '@ | Set-Content -LiteralPath (Join-Path $root 'ready.lua') -Encoding UTF8
+
+          @'
+          local out=os.getenv("RUNNER_TEMP").."\\hf89-real\\result.txt"
+          local n=0
+          while true do
+            local p=reaper.EnumProjects(n,"")
+            if not p then break end
+            n=n+1
+          end
+          local _,path=reaper.EnumProjects(-1,"")
+          local f=assert(io.open(out,"w"))
+          f:write("count="..tostring(n).."\n")
+          f:write("active="..tostring(path or "").."\n")
+          f:close()
+          '@ | Set-Content -LiteralPath (Join-Path $root 'Reopen_VocalLink.lua') -Encoding UTF8
+
+      - name: Verify exact HF89 policy output
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          . "$env:GITHUB_WORKSPACE\hf89\WindowPolicy.ps1"
+          $root=Join-Path $env:RUNNER_TEMP 'hf89-real'
+          $cfg=Join-Path $env:RUNNER_TEMP 'REAPER-HF89\reaper.ini'
+          $raw=@('-nonewinst','-cfgfile',$cfg,(Join-Path $root 'Client.rpp'),(Join-Path $root 'Reopen_VocalLink.lua'))
+          $filtered=@(ClientReconnectArguments 'CLIENT' $true $raw)
+          Write-Host ('RAW:      '+($raw -join ' | '))
+          Write-Host ('FILTERED: '+($filtered -join ' | '))
+          if($filtered.Count -ne 4){throw "HF89 policy did not remove exactly one RPP argument"}
+          if(($filtered | Where-Object {$_ -match '(?i)\.rpp$'}).Count -ne 0){throw 'HF89 policy left an RPP in reconnect command'}
+          if($filtered[-1] -notmatch '(?i)Reopen_VocalLink\.lua$'){throw 'HF89 policy removed reconnect Lua'}
+          $filtered | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'filtered_args.json') -Encoding UTF8
+
+      - name: Run HF89 against real REAPER
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName Microsoft.VisualBasic
+          $reaper=Join-Path $env:RUNNER_TEMP 'REAPER-HF89\reaper.exe'
+          $cfg=Join-Path $env:RUNNER_TEMP 'REAPER-HF89\reaper.ini'
+          $root=Join-Path $env:RUNNER_TEMP 'hf89-real'
+          $client=Join-Path $root 'Client.rpp'
+          $lua=Join-Path $root 'Reopen_VocalLink.lua'
+          $ready=Join-Path $root 'ready.lua'
+
+          Remove-Item (Join-Path $root 'ready.txt'),(Join-Path $root 'result.txt') -ErrorAction SilentlyContinue
+          $p=Start-Process -FilePath $reaper -ArgumentList @('-newinst','-nosplash','-ignoreerrors','-cfgfile',$cfg,$client,$ready) -PassThru
+          Write-Host "Started real REAPER pid=$($p.Id)"
+
+          Start-Sleep -Seconds 7
+          try {
+            [Microsoft.VisualBasic.Interaction]::AppActivate($p.Id) | Out-Null
+            [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+          } catch {}
+
+          $deadline=(Get-Date).AddSeconds(35)
+          while(!(Test-Path (Join-Path $root 'ready.txt')) -and (Get-Date) -lt $deadline){ Start-Sleep -Milliseconds 250 }
+          if(!(Test-Path (Join-Path $root 'ready.txt'))){ throw 'Real REAPER did not execute ready.lua' }
+
+          . "$env:GITHUB_WORKSPACE\hf89\WindowPolicy.ps1"
+          $raw=@('-nonewinst','-cfgfile',$cfg,$client,$lua)
+          $hf89=@(ClientReconnectArguments 'CLIENT' $true $raw)
+          Remove-Item (Join-Path $root 'result.txt') -ErrorAction SilentlyContinue
+          Start-Process -FilePath $reaper -ArgumentList $hf89 -Wait
+
+          $deadline=(Get-Date).AddSeconds(25)
+          while(!(Test-Path (Join-Path $root 'result.txt')) -and (Get-Date) -lt $deadline){ Start-Sleep -Milliseconds 200 }
+          if(!(Test-Path (Join-Path $root 'result.txt'))){ throw 'Real REAPER did not execute HF89 reconnect Lua' }
+          $result=Get-Content (Join-Path $root 'result.txt')
+          $count=[int](($result | Where-Object {$_ -like 'count=*'}) -replace 'count=','')
+          $active=(($result | Where-Object {$_ -like 'active=*'}) -replace 'active=','')
+          Write-Host "HF89 real REAPER: tabs=$count active=$active"
+          if($count -ne 1){throw "HF89 opened an extra project tab: tabs=$count"}
+          if([IO.Path]::GetFullPath($active) -ne [IO.Path]::GetFullPath($client)){throw "HF89 changed active project: $active"}
+
+          Remove-Item (Join-Path $root 'result.txt') -ErrorAction SilentlyContinue
+          $other=Join-Path $root 'Other.rpp'
+          Start-Process -FilePath $reaper -ArgumentList @('-nonewinst','-cfgfile',$cfg,$other,$lua) -Wait
+          $deadline=(Get-Date).AddSeconds(25)
+          while(!(Test-Path (Join-Path $root 'result.txt')) -and (Get-Date) -lt $deadline){ Start-Sleep -Milliseconds 200 }
+          if(!(Test-Path (Join-Path $root 'result.txt'))){ throw 'Control command did not execute Lua' }
+          $result=Get-Content (Join-Path $root 'result.txt')
+          $control=[int](($result | Where-Object {$_ -like 'count=*'}) -replace 'count=','')
+          $controlActive=(($result | Where-Object {$_ -like 'active=*'}) -replace 'active=','')
+          Write-Host "Pre-HF89 control: tabs=$control active=$controlActive"
+          if($control -lt 2){throw "Control command did not open another project tab; expected >=2, got $control"}
+
+          @(
+            'HF89_REAL_REAPER_PASS',
+            "HF89_tabs=$count",
+            "HF89_active=$active",
+            "PreHF89_tabs=$control",
+            "PreHF89_active=$controlActive"
+          ) | Set-Content -LiteralPath (Join-Path $root 'summary.txt') -Encoding UTF8
+          Stop-Process -Name reaper -Force -ErrorAction SilentlyContinue
+
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hf89-real-reaper-evidence
+          path: ${{ runner.temp }}\hf89-real\*
