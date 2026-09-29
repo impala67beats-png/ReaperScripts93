@@ -1,1 +1,2 @@
 Run real REAPER HF89 same-tab gate.
+Trigger: linux-xvfb real REAPER.
