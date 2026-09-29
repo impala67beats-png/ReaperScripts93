@@ -1,0 +1,152 @@
+name: HF89 real Linux REAPER gate
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  real-reaper-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Xvfb and download official REAPER 7.81
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb
+          cd "$RUNNER_TEMP"
+          curl -fL --retry 3 -o reaper.tar.xz https://dlcf.reaper.fm/7.x/reaper781_linux_x86_64.tar.xz
+          test $(stat -c%s reaper.tar.xz) -gt 10000000
+          tar -xJf reaper.tar.xz
+          test -x "$RUNNER_TEMP/reaper_linux_x86_64/REAPER/reaper"
+
+      - name: Create probe files
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/hf89-real"
+          mkdir -p "$ROOT"
+          cat > "$ROOT/Client.rpp" <<'EOF'
+          <REAPER_PROJECT 0.1 "7.81/linux-x86_64" 0
+            RIPPLE 0
+            GROUPOVERRIDE 0 0 0
+            AUTOXFADE 1
+          >
+          EOF
+          cat > "$ROOT/Other.rpp" <<'EOF'
+          <REAPER_PROJECT 0.1 "7.81/linux-x86_64" 0
+            RIPPLE 0
+            GROUPOVERRIDE 0 0 0
+            AUTOXFADE 1
+          >
+          EOF
+          cat > "$ROOT/ready.lua" <<'EOF'
+          local out=os.getenv("RUNNER_TEMP").."/hf89-real/ready.txt"
+          local _,path=reaper.EnumProjects(-1,"")
+          local f=assert(io.open(out,"w")); f:write(path or ""); f:close()
+          EOF
+          cat > "$ROOT/Reopen_VocalLink.lua" <<'EOF'
+          local out=os.getenv("RUNNER_TEMP").."/hf89-real/result.txt"
+          local n=0
+          while true do
+            local p=reaper.EnumProjects(n,"")
+            if not p then break end
+            n=n+1
+          end
+          local _,path=reaper.EnumProjects(-1,"")
+          local f=assert(io.open(out,"w"))
+          f:write("count="..tostring(n).."\n")
+          f:write("active="..tostring(path or "").."\n")
+          f:close()
+          EOF
+          printf '[REAPER]\nloadlastproj=0\nsplash=0\n' > "$ROOT/reaper.ini"
+
+      - name: Start Xvfb and real REAPER
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DISPLAY=:95
+          Xvfb :95 -screen 0 1280x900x24 -nolisten tcp -ac >"$RUNNER_TEMP/xvfb.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/xvfb.pid"
+          sleep 1
+          REAPER="$RUNNER_TEMP/reaper_linux_x86_64/REAPER/reaper"
+          ROOT="$RUNNER_TEMP/hf89-real"
+          "$REAPER" --no-gtk -newinst -nosplash -ignoreerrors -cfgfile "$ROOT/reaper.ini" "$ROOT/Client.rpp" "$ROOT/ready.lua" >"$ROOT/reaper.log" 2>&1 &
+          echo $! > "$ROOT/reaper.pid"
+          for i in $(seq 1 120); do
+            if [ -f "$ROOT/ready.txt" ]; then break; fi
+            if ! kill -0 $(cat "$ROOT/reaper.pid") 2>/dev/null; then
+              echo "REAPER exited early"; cat "$ROOT/reaper.log"; exit 1
+            fi
+            sleep 0.25
+          done
+          test -f "$ROOT/ready.txt"
+          echo "Real REAPER initial project: $(cat "$ROOT/ready.txt")"
+
+      - name: Run exact HF89 reconnect policy in real REAPER
+        shell: pwsh
+        env:
+          DISPLAY: ":95"
+        run: |
+          $ErrorActionPreference='Stop'
+          . "$env:GITHUB_WORKSPACE/hf89/WindowPolicy.ps1"
+          $reaper="$env:RUNNER_TEMP/reaper_linux_x86_64/REAPER/reaper"
+          $root="$env:RUNNER_TEMP/hf89-real"
+          $cfg="$root/reaper.ini"
+          $client="$root/Client.rpp"
+          $lua="$root/Reopen_VocalLink.lua"
+          $raw=@('-nonewinst','-cfgfile',$cfg,$client,$lua)
+          $hf89=@(ClientReconnectArguments 'CLIENT' $true $raw)
+          Write-Host ('HF89 argv: '+($hf89 -join ' | '))
+          if(($hf89 | Where-Object {$_ -match '(?i)\.rpp$'}).Count -ne 0){throw 'HF89 policy still forwards an RPP'}
+          Remove-Item "$root/result.txt" -ErrorAction SilentlyContinue
+          & $reaper @hf89
+          $deadline=(Get-Date).AddSeconds(20)
+          while(!(Test-Path "$root/result.txt") -and (Get-Date) -lt $deadline){Start-Sleep -Milliseconds 200}
+          if(!(Test-Path "$root/result.txt")){throw 'Real REAPER did not execute HF89 reconnect script'}
+          $lines=Get-Content "$root/result.txt"
+          $count=[int](($lines|Where-Object {$_ -like 'count=*'}) -replace 'count=','')
+          $active=(($lines|Where-Object {$_ -like 'active=*'}) -replace 'active=','')
+          Write-Host "HF89_REAL tabs=$count active=$active"
+          if($count -ne 1){throw "HF89 created extra tab: $count"}
+          if([IO.Path]::GetFullPath($active) -ne [IO.Path]::GetFullPath($client)){throw "HF89 changed active project: $active"}
+
+          Remove-Item "$root/result.txt" -ErrorAction SilentlyContinue
+          $other="$root/Other.rpp"
+          & $reaper '-nonewinst' '-cfgfile' $cfg $other $lua
+          $deadline=(Get-Date).AddSeconds(20)
+          while(!(Test-Path "$root/result.txt") -and (Get-Date) -lt $deadline){Start-Sleep -Milliseconds 200}
+          if(!(Test-Path "$root/result.txt")){throw 'Real REAPER did not execute pre-HF89 control script'}
+          $lines=Get-Content "$root/result.txt"
+          $control=[int](($lines|Where-Object {$_ -like 'count=*'}) -replace 'count=','')
+          $controlActive=(($lines|Where-Object {$_ -like 'active=*'}) -replace 'active=','')
+          Write-Host "PRE_HF89_REAL tabs=$control active=$controlActive"
+          if($control -lt 2){throw "Pre-HF89 control did not open another tab: $control"}
+          @(
+            'HF89_REAL_REAPER_PASS',
+            "HF89_tabs=$count",
+            "HF89_active=$active",
+            "PreHF89_tabs=$control",
+            "PreHF89_active=$controlActive"
+          ) | Set-Content "$root/summary.txt"
+
+      - name: Print evidence
+        if: always()
+        shell: bash
+        run: |
+          ROOT="$RUNNER_TEMP/hf89-real"
+          echo "=== summary ==="
+          cat "$ROOT/summary.txt" 2>/dev/null || true
+          echo "=== reaper log ==="
+          tail -100 "$ROOT/reaper.log" 2>/dev/null || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hf89-real-linux-reaper-evidence
+          path: ${{ runner.temp }}/hf89-real/*
