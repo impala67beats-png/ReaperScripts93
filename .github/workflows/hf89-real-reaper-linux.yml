@@ -144,6 +144,13 @@ jobs:
           echo "=== reaper log ==="
           tail -100 "$ROOT/reaper.log" 2>/dev/null || true
 
+      - name: Upload REAPER distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: reaper781-linux-x86_64
+          path: ${{ runner.temp }}/reaper.tar.xz
+          compression-level: 0
+
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
